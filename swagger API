@@ -1,0 +1,412 @@
+package io.swagger.api;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+
+import javax.ws.rs.GET;
+import javax.ws.rs.Path;
+import javax.ws.rs.Produces;
+import javax.ws.rs.core.MediaType;
+import javax.ws.rs.core.Response;
+import javax.ws.rs.core.Response.Status;
+
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import com.google.maps.DirectionsApi;
+import com.google.maps.DistanceMatrixApi;
+import com.google.maps.GaeRequestHandler;
+import com.google.maps.GeoApiContext;
+import com.google.maps.GeocodingApi;
+import com.google.maps.errors.ApiException;
+import com.google.maps.model.DirectionsResult;
+import com.google.maps.model.DistanceMatrix;
+import com.google.maps.model.GeocodingResult;
+import com.google.maps.model.TravelMode;
+
+import io.swagger.model.StopWithId;
+import io.swagger.mysql.DataAccess;
+
+public class GoogleAPIService {
+	
+	private static GoogleAPIService instance = null;
+	private GeoApiContext context = null;
+	private final static String API_KEY = "AIzaSyAGk3rOXKAWocXRHGkqynuUVcvX2slmZT8";
+	
+	DataAccess dataAccess;
+	
+	private GoogleAPIService() {
+		dataAccess = DataAccess.getInstance();	}
+	
+	public static GoogleAPIService getInstance()
+	{
+		if(instance == null)
+		{
+			instance = new GoogleAPIService();
+		}
+		return instance;
+	}
+	
+	private GeoApiContext getContext()
+	{
+		if(context == null)
+		{
+			context = new GeoApiContext.Builder()
+				    .apiKey(API_KEY)
+				    //.requestHandlerBuilder(GaeRequestHandler.Builder.build())
+				    .build();
+		}
+		return context;
+	}
+	
+	public String geocode(String address)
+	{
+			getContext();
+			GeocodingResult[] results;
+			try {
+				results = GeocodingApi.geocode(context,
+				    address).await();
+			} catch (ApiException | InterruptedException | IOException e) {
+				results = null;
+				e.printStackTrace();
+			}
+			Gson gson = new GsonBuilder().setPrettyPrinting().create();
+			context.shutdown();
+			//System.out.println(gson.toJson(results[0].geometry.location));
+			return gson.toJson(results[0].geometry.location);
+	}
+	
+	public String route(String origin, String destination)
+	{
+		getContext();
+		DirectionsResult results;
+		try {
+			results = DirectionsApi.getDirections(context,
+			    origin, destination)
+					.mode(TravelMode.DRIVING)
+					.await();
+		} catch (ApiException | InterruptedException | IOException e) {
+			results = null;
+			e.printStackTrace();
+		}
+		Gson gson = new GsonBuilder().setPrettyPrinting().create();
+		context.shutdown();
+		return gson.toJson(results.routes.toString());
+	}
+	
+	public String distance(String[] origin, String[] destination)
+	{
+		getContext();
+		DistanceMatrix results;
+		try {
+			results = DistanceMatrixApi.getDistanceMatrix(context,
+			    origin, destination)
+					.await();
+		} catch (ApiException | InterruptedException | IOException e) {
+			results = null;
+			e.printStackTrace();
+		}
+		Gson gson = new GsonBuilder().setPrettyPrinting().create();
+		context.shutdown();
+		System.out.println(gson.toJson(results.rows[0].elements[0].duration));
+		return gson.toJson(results.rows[0].elements[0].duration);
+	}
+	
+	public Response optimizeRide(int rideId)
+	{	
+		Boolean prioChanged = true; //Prüfvariable ob sich noch Prioritäten ändern (um endlossschleifen zu vermeiden wenn zwei Stops zusammen auf der höchsten Prio sind aber keine Beziehun zu einander haben)
+		List<StopWithId> stops = dataAccess.getAcceptedStops(rideId); //Muss die Stops so zurückgeben, dass der Erste vorne und der Letzte hinten ist
+		int size = stops.size();
+		StopWithId start = stops.remove(0);
+		StopWithId end = stops.remove(stops.size()-1);
+		//2dimensionales Array um stopId[][1] mit prio[][2] zu verbinden
+		int[][] prioMap = new int[stops.size()][2];
+		List<Integer> allWaypoints = new ArrayList<Integer>();
+		for(int i = 0; i < stops.size(); i++)
+		{
+			allWaypoints.add(stops.get(i).getStopId());
+		}
+		System.out.println("Bin oben");
+		for(int i = 0; i < stops.size(); i++)
+		{
+			prioMap[i][1] = stops.remove(0).getStopId();
+			//prüfe ob user die bei diesem ride einsteigen, bei einem anderen aussteigen (das bedeutet, das dieser vor dem anderen sein muss)
+			
+			if(dataAccess.hasPrioOver(rideId, allWaypoints))//Wenn ja erhöhe eine temporäre variable
+			{
+				prioMap[i][2] = prioMap[i][2] + 1;
+			}			
+			
+		}
+		// wenn 2 stops gleichzeitig den höchsten Wert bei der prio haben, aufjeden Fall aber einmal durchlaufen
+		while(isNotSorted(prioMap) && prioChanged)
+		{
+			//Dann nur vergleichen ob die Stops der höchsten Prio hasPrio übereinander haben, wenn nein ist die Prio Fertig, wenn ja anpassen und Bedingung noch einmal checken
+			//int liste mit allen stopIds erzeugen, die die höchste Prio haben
+			List<Integer> highestPrioIds;
+			highestPrioIds = highestPrioIds(prioMap);
+			boolean changedThisCycle = false;
+			prioChanged = false;
+			for(int i = 0; i < prioMap.length; i++)
+			{
+				if(highestPrioIds.contains(prioMap[i][1]))
+				{
+					if(dataAccess.hasPrioOver(highestPrioIds.get(i), highestPrioIds))
+					{
+						prioMap[i][2] = prioMap[i][2]+1;
+						changedThisCycle = true;
+					}
+				}
+
+			}
+			if(changedThisCycle == true)
+			{
+				prioChanged = true;
+			}
+		}
+		int timeForThisRoute = 0;
+		
+		//prioMap in Liste umwandeln
+		List<Integer> orderedStops = new ArrayList<Integer>();
+		orderedStops.add(start.getStopId());
+		java.util.Arrays.sort(prioMap, java.util.Comparator.comparingInt(a -> a[1]));
+		for(int i = 0; i < prioMap.length; i++)
+		{
+			orderedStops.add(prioMap[i][1]);
+		}
+		orderedStops.add(end.getStopId());
+		//liste durchgehen und je zwei lat/long an distance matrix
+		for(int i = 0; i < orderedStops.size()-1; i++)
+		{
+			String[] origin =  {dataAccess.getStopById(orderedStops.get(i)).getAddress()};
+			String[] destination = {dataAccess.getStopById(orderedStops.get(i+1)).getAddress()};
+			
+			//String time = distance(origin, destination);          Library hat einen Bug
+			//System.out.println(time);
+			
+			dataAccess.setRank(orderedStops.get(i) , i);
+		}
+		return Response.status(Status.OK).entity(new ApiResponseMessage(ApiResponseMessage.OK, "Stops accepted and ride optimized")).build();
+		
+		/*
+		//Alle möglichen (Start als erstes, Rides mit höherer Prio nicht nach welchen mit niedriegerer, Ende als letztes) Kombinationen herausfinden
+		//Von Stop zu Stop an die Distance Matrix senden und die Summe der Fahrt Dauer für jede Kombination speichern
+		//Dann die kürzeste OPtion nehmen und die Ranks entsprechend anpassen
+		for(int i = 0; i < getPossibleCombinations(prioMap); i++)
+		{
+			//
+			List<Integer> combination = new ArrayList<Integer>();
+			combination.add(start.getStopId());
+			//Herausfinden ob es für die nächsthöchste Prio 
+			
+		}
+		
+	    List<List<Integer>> combinations =  new ArrayList<>();
+		//List<Integer> combination = new ArrayList<Integer>();
+		//combination.add(start.getStopId());
+		int lastPrioChecked = 10;
+		for(int i = 0; i < numberDifferentPrios(prioMap); i++)
+		{
+			List<Integer> nextStopIds = getStopIdsWithNextHighestPrio(prioMap, lastPrioChecked);
+			/*for(int j = 0; j < nextStopIds.size(); j++)
+			{
+				combination.add(nextStopIds.get(j));
+				for(int k = j+1; k < nextStopIds.size(); k++)
+				{
+					
+				}
+			}
+			//start an alle vorne anfügen, nachfolgende an alle hinten anfügen, stop ganz am ende
+			//dann index aus der oberen liste mit array gleichsetzen wo zeitwert zwischengespeichert wird
+			List<List<Integer>> combinationsForThisPrio = combinations(nextStopIds, nextStopIds.size());
+			//Die Ridekombinationen dieser Prio so oft hinzufügen, dass sich die maximale Kombinationsanzahl ergibt
+			for(int k = 0; k < (getPossibleCombinations(prioMap)/combinationsForThisPrio.size()); k++)
+			{
+				for(int j = 0; j < combinationsForThisPrio.size(); j++)
+				{
+					combinations.add(combinationsForThisPrio.get(j));//StopIds müssen an die bestehenden Listen hintenangefügt werden
+					combinationsForThisPrio.get(j);
+				}
+			}
+			//Eigentlich müsste man alle Kombinationen einer List<List<List<Integer>>> herausfinden --- 
+			//An jede Liste mit StopIds vorne den Start und hinten as Ende einfügen
+			for(int j = 0; j < combinations.size(); j++)
+			{
+				combinations.get(j).add(0, start.getStopId());
+				combinations.get(j).add(end.getStopId());
+			}
+			//int[] timeForThisRoute = new int[combinations.size()];
+			for(int j = 0; j < combinations.size(); j++)
+			{
+				
+			}
+		}*/
+		
+	}
+	private Integer getHighestPrioId(int[][] prioMap) {
+		// TODO Auto-generated method stub
+		return null;
+	}
+
+	//ACHTUNG Stops können zeitgleich auf der höchsten Prio sein, Lösung benötigt um in keinen Loop zu kommen - Done
+	public Boolean isNotSorted(int[][] prioMap)
+	{
+		int highest = 0;
+		int counter = 0;
+		for(int i = 0; i < prioMap.length; i++)
+		{
+			if(prioMap[i][2] > highest)
+			{
+				highest = prioMap[i][2];
+			}
+		}
+		for(int i = 0; i < prioMap.length; i++)
+		{
+			if(prioMap[i][2] == highest)
+			{
+				counter++;
+			}
+		}
+		if(counter > 1)
+		{
+			return true;
+		}
+		else {
+			return false;
+		}
+	}
+	
+	public List<Integer> highestPrioIds(int[][] prioMap)
+	{
+		List<Integer> stopIds = new ArrayList<Integer>();
+		int highest = 0;
+		for(int i = 0; i < prioMap.length; i++)
+		{
+			if(prioMap[i][2] > highest)
+			{
+				highest = prioMap[i][2];
+			}
+		}
+		for(int i = 0; i < prioMap.length; i++)
+		{
+			if(prioMap[i][2] == highest)
+			{
+				stopIds.add(prioMap[i][1]);
+			}
+		}
+		return stopIds;
+	}
+	
+	public int getPossibleCombinations(int[][] prioMap)
+	{
+		int counterCombinations = 1;
+		//anzahl möglicher Kombinationen zurückgeben, maximal sind 4 Stops in der prio map (da start und ziel entfernt wurden)
+		//wenn zwei oder mehr rides die gleiche Prio haben können sie vor oder nacheinander kommen, die anzahl möglicher kombinationen ist n! für diese prio
+		for(int i = 0; i < prioMap.length; i++)
+		{
+			int prioOfThisRide = prioMap[i][2];
+			List<Integer> priosThatWereChecked = new ArrayList<Integer>();
+			int counterSamePrio = 1;
+
+			if(priosThatWereChecked.contains(prioOfThisRide) == false)//nur wenn diese prio noch nicht geprüft wurde
+			for(int j = i+1; j < prioMap.length; j++) //Checke alle nachfolgenden
+			{
+				if(prioMap[j][2] == prioOfThisRide)
+				{
+					counterSamePrio++;
+				}
+			}
+			priosThatWereChecked.add(prioOfThisRide);
+			counterSamePrio = factorial(counterSamePrio);
+			counterCombinations = counterCombinations*counterSamePrio;
+		}
+		
+		return counterCombinations;
+	}
+	
+	public static int factorial(int number) {
+        int result = 1;
+
+        for (int factor = 2; factor <= number; factor++) {
+            result *= factor;
+        }
+
+        return result;
+    }
+	
+	public List<Integer> getStopIdsWithNextHighestPrio (int[][] prioMap, int lastHighestPrio)
+	{
+		List<Integer> nextPrioStops = new ArrayList<Integer>();
+		int highest = 0;
+		for(int i = 0; i < prioMap.length; i++)
+		{
+			if(prioMap[i][2] > highest && prioMap[i][2] < lastHighestPrio)
+			{
+				highest = prioMap[i][2];
+			}
+		}
+		for(int i = 0; i < prioMap.length; i++)
+		{
+			if(prioMap[i][2] == highest)
+			{
+				nextPrioStops.add(prioMap[i][1]);
+			}
+		}
+		
+		return nextPrioStops;
+		
+	}
+	
+	public int numberDifferentPrios(int[][] prioMap)
+	{
+		int counter = 0;
+		List<Integer> prios = new ArrayList<Integer>();
+		for(int i = 0; i < prioMap.length; i++)
+		{
+			if(!prios.contains(prioMap[i][2]))
+			{
+				prios.add(prioMap[i][2]);
+				counter++;
+			}
+		}
+		return counter;
+	}
+	
+	@SuppressWarnings("unchecked")
+	private static List<List<Integer>> combinations(List<Integer> list, int maxLength) {
+	    return combinations(list, maxLength, new ArrayList(), new ArrayList());
+	  }
+
+	  private static List<List<Integer>> combinations(List<Integer> list, int length, List<Integer> current, List<List<Integer>> result) {
+	    if (length == 0) {
+	      List<List<Integer>> newResult =  new ArrayList<>(result);
+	      newResult.add(current);
+	      printCombinations(newResult);
+	      return newResult;
+	    }
+
+	    List<List<List<Integer>>> res3 = new ArrayList<>();
+	    for (Integer i : list) {
+	      List<Integer> newCurrent = new ArrayList<>(current);
+	      newCurrent.add(i);
+	      res3.add(combinations(list, length - 1, newCurrent, result));
+	    }
+
+	    List<List<Integer>> res2 = new ArrayList<>();
+	    for (List<List<Integer>> lst : res3) {
+	      res2.addAll(lst);
+	    }
+	    return res2;
+	  }
+	  
+	  public static void printCombinations(List<List<Integer>> list) {
+		    for (List<Integer> lst : list) {
+		      String line = "";
+		      for (Integer i : lst) {
+		        line += i;
+		      }
+		      System.out.println(line);
+		    }
+		  }
+	
+}
